@@ -1,0 +1,58 @@
+# ──────────────────────────────────────────────
+# CASDA .gitignore
+# ──────────────────────────────────────────────
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data (large files — not tracked in git)
+data/
+
+# Model weights / checkpoints
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.bin
+checkpoints/
+
+# Experiment outputs
+outputs/
+results/
+runs/
+logs/
+*.log
+
+# Miscellaneous
+nul
+*.tmp
+*.bak

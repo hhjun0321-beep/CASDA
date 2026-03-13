@@ -1,0 +1,460 @@
+"""
+ROI Extraction and Data Packaging Module
+
+This module implements the complete pipeline from PROJECT(roi).md:
+1. Background analysis (grid-based labeling)
+2. Defect analysis (4 indicators)
+3. ROI suitability assessment
+4. ROI extraction with position optimization
+5. Data packaging for ControlNet training
+
+Performance (v5):
+- Pre-indexed DataFrame lookup via build_image_index() — O(1) per image
+- Single image load per image (was loaded twice in v4)
+- Masks decoded once per image (was decoded twice in v4)
+- Optional multiprocessing via concurrent.futures
+"""
+import numpy as np
+import cv2
+import pandas as pd
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+import os
+
+from ..utils.rle_utils import decode_mask_from_csv, get_all_masks_for_image, build_image_index
+from src.analysis.defect_characterization import DefectCharacterizer
+from src.analysis.background_characterization import BackgroundAnalyzer
+from src.analysis.roi_suitability import ROISuitabilityEvaluator
+
+
+# ── 병렬 워커 함수 (ProcessPoolExecutor용 — 모듈 레벨 정의 필수) ──
+
+def _process_single_image_worker(args_tuple):
+    """
+    단일 이미지에서 ROI를 추출하는 워커 함수.
+
+    ProcessPoolExecutor에서 pickle 직렬화가 가능하도록
+    모듈 레벨에 정의. ROIExtractor 인스턴스를 워커 내에서 재생성한다.
+
+    Args:
+        args_tuple: (image_id, image_dir_str, train_csv_str,
+                     roi_size, min_suitability, grid_size,
+                     save_patches, output_dir_str)
+
+    Returns:
+        list of roi_data dicts, 또는 빈 리스트
+    """
+    (image_id, image_dir_str, train_csv_str,
+     roi_size, min_suitability, grid_size,
+     save_patches, output_dir_str) = args_tuple
+
+    from pathlib import Path
+
+    image_path = str(Path(image_dir_str) / image_id)
+    if not Path(image_path).exists():
+        return []
+
+    # 워커 내부에서 필요한 객체 재생성 (pickle 회피)
+    defect_analyzer = DefectCharacterizer()
+    background_analyzer = BackgroundAnalyzer(
+        grid_size=grid_size,
+        variance_threshold=100.0,
+        edge_threshold=0.3,
+    )
+    roi_evaluator = ROISuitabilityEvaluator(defect_analyzer, background_analyzer)
+
+    extractor = ROIExtractor(
+        defect_analyzer=defect_analyzer,
+        background_analyzer=background_analyzer,
+        roi_evaluator=roi_evaluator,
+        roi_size=roi_size,
+        min_suitability=min_suitability,
+    )
+
+    import pandas as pd
+    train_df = pd.read_csv(train_csv_str)
+    image_index = build_image_index(train_df)
+
+    # 이미지 로드
+    image = cv2.imread(image_path)
+    if image is None:
+        return []
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    h, w = image_rgb.shape[:2]
+
+    masks = get_all_masks_for_image(image_id, train_df, shape=(h, w),
+                                    image_index=image_index)
+    if len(masks) == 0:
+        return []
+
+    roi_results, _, _ = extractor.process_single_image(
+        image_path, train_df, image_id,
+        image_rgb=image_rgb, masks=masks, image_index=image_index,
+    )
+
+    if len(roi_results) == 0:
+        return []
+
+    output_dir = Path(output_dir_str)
+
+    # 패치 저장
+    all_roi_data = []
+    for roi_data in roi_results:
+        if save_patches:
+            class_id = roi_data['class_id']
+            mask = masks.get(class_id)
+            if mask is not None:
+                roi_data = extractor.save_roi_data(
+                    image_rgb, mask, roi_data, output_dir, save_patches
+                )
+        all_roi_data.append(roi_data)
+
+    return all_roi_data
+
+
+class ROIExtractor:
+    """
+    Complete ROI extraction pipeline.
+    """
+    
+    def __init__(self, 
+                 defect_analyzer: Optional[DefectCharacterizer] = None,
+                 background_analyzer: Optional[BackgroundAnalyzer] = None,
+                 roi_evaluator: Optional[ROISuitabilityEvaluator] = None,
+                 roi_size: int = 256,
+                 min_suitability: float = 0.5):
+        """
+        Initialize ROI extractor.
+        
+        Args:
+            defect_analyzer: DefectCharacterizer instance
+            background_analyzer: BackgroundAnalyzer instance
+            roi_evaluator: ROISuitabilityEvaluator instance
+            roi_size: Target ROI patch size. v5에서 256으로 변경 
+                (Severstal 이미지 높이 256px에 맞춤, 학습 시 2x 업스케일).
+                기존 512는 1600x256 이미지에서 항상 실패함.
+            min_suitability: Minimum suitability score to accept ROI
+        """
+        self.defect_analyzer = defect_analyzer or DefectCharacterizer()
+        self.background_analyzer = background_analyzer or BackgroundAnalyzer(
+            grid_size=64, 
+            variance_threshold=100.0,
+            edge_threshold=0.3
+        )
+        self.roi_evaluator = roi_evaluator or ROISuitabilityEvaluator(
+            self.defect_analyzer,
+            self.background_analyzer
+        )
+        self.roi_size = roi_size
+        self.min_suitability = min_suitability
+    
+    def process_single_image(self, image_path: str, train_df: pd.DataFrame, 
+                            image_id: str,
+                            image_rgb: Optional[np.ndarray] = None,
+                            masks: Optional[Dict[int, np.ndarray]] = None,
+                            image_index: Optional[dict] = None) -> Tuple[List[Dict], Optional[np.ndarray], Optional[Dict[int, np.ndarray]]]:
+        """
+        Process a single image and extract all suitable ROIs.
+        
+        Performance (v5): accepts pre-loaded image and masks to avoid
+        redundant I/O and DataFrame scanning. Returns them for reuse
+        by the caller (save_roi_data).
+        
+        Args:
+            image_path: Path to image file
+            train_df: Training dataframe with mask annotations
+            image_id: Image identifier
+            image_rgb: Pre-loaded RGB image (optional, loaded if None)
+            masks: Pre-decoded masks dict (optional, decoded if None)
+            image_index: Pre-built DataFrame index for O(1) lookup
+            
+        Returns:
+            Tuple of (roi_results_list, image_rgb, masks)
+        """
+        # Load image only if not pre-loaded
+        if image_rgb is None:
+            image = cv2.imread(image_path)
+            if image is None:
+                return [], None, None
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        h, w = image_rgb.shape[:2]
+        
+        # Step 1: Background analysis
+        background_analysis = self.background_analyzer.analyze_image(image_rgb)
+        
+        # Step 2: Get all defect masks (only if not pre-loaded)
+        if masks is None:
+            masks = get_all_masks_for_image(image_id, train_df, shape=(h, w),
+                                            image_index=image_index)
+        
+        if len(masks) == 0:
+            return [], image_rgb, masks
+        
+        # Step 3: Analyze each defect class
+        roi_results = []
+        
+        for class_id, mask in masks.items():
+            # Analyze all separate defects in this class mask
+            defect_regions = self.defect_analyzer.analyze_all_defects_in_mask(
+                mask, class_id
+            )
+            
+            for defect_metrics in defect_regions:
+                # Get initial bbox from defect
+                defect_bbox = defect_metrics['bbox']
+                
+                # Always optimize ROI position (v5: adaptive sizing for
+                # non-square images like 1600x256 Severstal images)
+                optimized_bbox = self.roi_evaluator.optimize_roi_position(
+                    image_rgb,
+                    defect_metrics,
+                    background_analysis,
+                    roi_size=self.roi_size,
+                    search_radius=32
+                )
+                
+                if optimized_bbox is not None:
+                    roi_bbox = optimized_bbox
+                else:
+                    # Fallback: pad defect bbox with context (v5)
+                    # 기존 v4에서는 defect_bbox를 그대로 사용하여
+                    # 15-45px 패치가 512x512로 10-34x 업스케일되는 문제 발생.
+                    # v5: 최소 min_context_pixels 만큼 패딩 추가.
+                    dx1, dy1, dx2, dy2 = defect_bbox
+                    pad = 64  # minimum context padding
+                    roi_bbox = (
+                        max(0, dx1 - pad),
+                        max(0, dy1 - pad),
+                        min(w, dx2 + pad),
+                        min(h, dy2 + pad),
+                    )
+                
+                # Evaluate suitability with the ROI bbox
+                suitability = self.roi_evaluator.evaluate_roi_suitability(
+                    defect_metrics,
+                    background_analysis,
+                    roi_bbox
+                )
+                
+                # Only keep ROIs above threshold
+                if roi_bbox is not None and suitability['suitability_score'] >= self.min_suitability:
+                    # Generate prompt
+                    prompt = self.roi_evaluator.generate_prompt_for_roi(
+                        suitability['defect_subtype'],
+                        suitability['background_type'],
+                        class_id
+                    )
+                    
+                    roi_data = {
+                        'image_id': image_id,
+                        'class_id': class_id,
+                        'region_id': defect_metrics['region_id'],
+                        'roi_bbox': roi_bbox,
+                        'defect_bbox': defect_bbox,
+                        'centroid': defect_metrics['centroid'],
+                        'area': defect_metrics['area'],
+                        'linearity': defect_metrics['linearity'],
+                        'solidity': defect_metrics['solidity'],
+                        'extent': defect_metrics['extent'],
+                        'aspect_ratio': defect_metrics['aspect_ratio'],
+                        'defect_subtype': suitability['defect_subtype'],
+                        'background_type': suitability['background_type'],
+                        'suitability_score': suitability['suitability_score'],
+                        'matching_score': suitability['matching_score'],
+                        'continuity_score': suitability['continuity_score'],
+                        'stability_score': suitability['stability_score'],
+                        'recommendation': suitability['recommendation'],
+                        'prompt': prompt
+                    }
+                    
+                    roi_results.append(roi_data)
+        
+        return roi_results, image_rgb, masks
+    
+    def extract_roi_patch(self, image: np.ndarray, mask: np.ndarray, 
+                         roi_bbox: Tuple[int, int, int, int]) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Extract ROI patch from image and mask.
+        
+        Args:
+            image: Original image (H, W, 3)
+            mask: Binary mask (H, W)
+            roi_bbox: (x1, y1, x2, y2)
+            
+        Returns:
+            Tuple of (roi_image, roi_mask)
+        """
+        x1, y1, x2, y2 = roi_bbox
+        roi_image = image[y1:y2, x1:x2].copy()
+        roi_mask = mask[y1:y2, x1:x2].copy()
+        
+        return roi_image, roi_mask
+    
+    def save_roi_data(self, image: np.ndarray, mask: np.ndarray,
+                     roi_data: Dict, output_dir: Path, 
+                     save_patches: bool = True) -> Dict:
+        """
+        Save ROI patch and update metadata.
+        
+        Args:
+            image: Original image
+            mask: Binary mask for this class
+            roi_data: ROI metadata dictionary
+            output_dir: Output directory
+            save_patches: Whether to save image/mask patches
+            
+        Returns:
+            Updated roi_data with file paths
+        """
+        roi_bbox = roi_data['roi_bbox']
+        
+        if save_patches:
+            # Extract patches
+            roi_image, roi_mask = self.extract_roi_patch(image, mask, roi_bbox)
+            
+            # Create filename
+            image_id = roi_data['image_id']
+            class_id = roi_data['class_id']
+            region_id = roi_data['region_id']
+            filename = f"{image_id}_class{class_id}_region{region_id}"
+            
+            # Save image patch
+            image_dir = output_dir / 'images'
+            image_dir.mkdir(parents=True, exist_ok=True)
+            image_path = image_dir / f"{filename}.png"
+            cv2.imwrite(str(image_path), cv2.cvtColor(roi_image, cv2.COLOR_RGB2BGR))
+            
+            # Save mask patch
+            mask_dir = output_dir / 'masks'
+            mask_dir.mkdir(parents=True, exist_ok=True)
+            mask_path = mask_dir / f"{filename}.png"
+            cv2.imwrite(str(mask_path), roi_mask * 255)
+            
+            roi_data['roi_image_path'] = str(image_path)
+            roi_data['roi_mask_path'] = str(mask_path)
+        
+        return roi_data
+    
+    def process_dataset(self, image_dir: Path, train_csv: Path, 
+                       output_dir: Path, save_patches: bool = True,
+                       max_images: Optional[int] = None,
+                       num_workers: int = 0) -> pd.DataFrame:
+        """
+        Process entire dataset and extract all ROIs.
+        
+        Performance (v5):
+        - Pre-builds image index for O(1) DataFrame lookup
+        - Loads each image exactly once (was twice in v4)
+        - Decodes masks exactly once per image (was twice in v4)
+        - Optional multiprocessing via num_workers > 0
+        
+        Args:
+            image_dir: Directory containing training images
+            train_csv: Path to train.csv with annotations
+            output_dir: Output directory for ROI data
+            save_patches: Whether to save image/mask patches
+            max_images: Maximum number of images to process (for testing)
+            num_workers: Number of parallel workers (0 = sequential)
+            
+        Returns:
+            DataFrame with all ROI metadata
+        """
+        # Load training data
+        train_df = pd.read_csv(train_csv)
+        
+        # Pre-build image index for O(1) lookup (v5 optimization)
+        print("  Building image index...")
+        image_index = build_image_index(train_df)
+        
+        # Get unique images that have defects
+        image_ids = train_df['ImageId'].unique()
+        
+        if max_images is not None:
+            image_ids = image_ids[:max_images]
+        
+        all_roi_data = []
+        
+        use_parallel = num_workers > 1 and len(image_ids) > 10
+        
+        if use_parallel:
+            # ── 병렬 경로: ProcessPoolExecutor ──
+            print(f"  병렬 모드: {num_workers} workers, {len(image_ids)} images")
+            
+            # output_dir 하위 디렉토리 미리 생성 (워커에서 race condition 방지)
+            (output_dir / 'images').mkdir(parents=True, exist_ok=True)
+            (output_dir / 'masks').mkdir(parents=True, exist_ok=True)
+            
+            # BackgroundAnalyzer의 grid_size를 워커에 전달
+            grid_size = self.background_analyzer.grid_size if hasattr(
+                self.background_analyzer, 'grid_size') else 64
+            
+            tasks = [
+                (img_id, str(image_dir), str(train_csv),
+                 self.roi_size, self.min_suitability, grid_size,
+                 save_patches, str(output_dir))
+                for img_id in image_ids
+            ]
+            
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(_process_single_image_worker, t): t[0]
+                    for t in tasks
+                }
+                for future in tqdm(as_completed(futures),
+                                   total=len(futures),
+                                   desc="Processing images (parallel)"):
+                    result = future.result()
+                    if result:
+                        all_roi_data.extend(result)
+        else:
+            # ── 순차 경로 (기존 동작) ──
+            # Process each image (single-load pattern)
+            for image_id in tqdm(image_ids, desc="Processing images"):
+                image_path = str(image_dir / image_id)
+                
+                if not Path(image_path).exists():
+                    continue
+                
+                # Load image ONCE
+                image = cv2.imread(image_path)
+                if image is None:
+                    continue
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                h, w = image_rgb.shape[:2]
+                
+                # Decode masks ONCE using pre-built index
+                masks = get_all_masks_for_image(image_id, train_df, shape=(h, w),
+                                                image_index=image_index)
+                
+                if len(masks) == 0:
+                    continue
+                
+                # Extract ROIs (pass pre-loaded image and masks)
+                roi_results, _, _ = self.process_single_image(
+                    image_path, train_df, image_id,
+                    image_rgb=image_rgb, masks=masks, image_index=image_index
+                )
+                
+                if len(roi_results) == 0:
+                    continue
+                
+                # Save each ROI (reuse already-loaded image and masks)
+                for roi_data in roi_results:
+                    if save_patches:
+                        class_id = roi_data['class_id']
+                        mask = masks.get(class_id)
+                        if mask is not None:
+                            roi_data = self.save_roi_data(
+                                image_rgb, mask, roi_data, output_dir, save_patches
+                            )
+                    
+                    all_roi_data.append(roi_data)
+        
+        # Convert to DataFrame
+        roi_df = pd.DataFrame(all_roi_data)
+        
+        return roi_df
